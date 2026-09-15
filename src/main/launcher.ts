@@ -29,10 +29,12 @@ import {
 import {
   applyCorePreference,
   emulatorLabel,
+  emulatorReadsPlaylist,
   findPreferredCores,
   hasPlatformSpecificEmulator,
   resolveLaunch,
 } from "./emulator/resolve.ts";
+import { syncDiscSet } from "./discs/sync.ts";
 import { createProgressGate, createRateMeter } from "./progress.ts";
 import { ensureRom } from "./rom-cache.ts";
 import { resolveSavePaths } from "./saves/paths.ts";
@@ -512,6 +514,40 @@ export class Launcher {
       // landing during it is only observed here.
       throwIfCancelled(controller.signal);
 
+      // A disc set is fetched as the individual discs the server holds,
+      // because the archive the content endpoint would otherwise hand over is
+      // not something any emulator can boot a multi-disc game out of. Returns
+      // null for everything else, including a server that would not answer, and
+      // the ordinary download below runs.
+      const shouldReportDisc = createProgressGate();
+      const discRateOf = createRateMeter();
+      const discs = await syncDiscSet({
+        config,
+        session,
+        romId: request.romId,
+        signal: controller.signal,
+        playlist: emulatorReadsPlaylist(config, request.platformSlug),
+        onProgress: (fileName, received, total, index, count) => {
+          const progress = total ? received / total : undefined;
+          if (!shouldReportDisc(progress)) return;
+          this.emit({
+            romId: request.romId,
+            status: "downloading",
+            stage: "rom",
+            // Named, and placed in the set, so four discs read as four
+            // transfers rather than one that keeps restarting at zero.
+            disc: fileName,
+            discIndex: index,
+            discCount: count,
+            progress,
+            received,
+            total: total ?? undefined,
+            bytesPerSecond: discRateOf(received),
+          });
+        },
+      });
+      throwIfCancelled(controller.signal);
+
       // When the server runs on this machine the file is already on local disk,
       // so copying it into the cache would mean holding a second multi-gigabyte
       // copy and waiting for a transfer that never needed to happen.
@@ -522,7 +558,9 @@ export class Launcher {
       );
 
       let romPath: string;
-      if (inLibrary) {
+      if (discs) {
+        romPath = discs;
+      } else if (inLibrary) {
         romPath = inLibrary;
       } else {
         this.emit({
